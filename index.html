@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<!--
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+-->
+<meta charset="utf-8">
+<title>iotop</title>
+<style type="text/css">
+table.fixed { table-layout:fixed; }
+table.fixed td, table.fixed th { overflow:hidden; white-space: nowrap; text-overflow: ellipsis }
+table#processlist { text-align:left; border-collapse:collapse; width:100% }
+table#processlist th, table#processlist td { border:1px solid black; }
+.chart .read { fill: #3333ff }
+.chart .read:hover { fill: #6666ff }
+.chart .write { fill: #ff0000 }
+.chart .write:hover { fill: #ff4444 }
+
+.axis { shape-rendering: crispEdges; pointer-events:none }
+.axis line, .axis path { fill: none; stroke: #000; }
+.d3-tip {
+  line-height: 1;
+  font-weight: bold;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  border-radius: 2px;
+  white-space: nowrap;
+  overflow:hidden;
+  text-overflow: ellipsis;
+  max-width:20em;
+}
+
+/* Creates a small triangle extender for the tooltip */
+.d3-tip:after {
+  box-sizing: border-box;
+  display: inline;
+  font-size: 10px;
+  width: 100%;
+  line-height: 1;
+  color: rgba(0, 0, 0, 0.8);
+  content: "\25BC";
+  position: absolute;
+  text-align: center;
+}
+
+/* Style northward tooltips differently */
+.d3-tip.n:after {
+  margin: -1px 0 0 0;
+  top: 100%;
+  left: 0;
+}
+
+rect.pane {
+  cursor: move;
+  fill: none;
+  pointer-events: all;
+}
+</style>
+
+<script src="d3.min.js" charset="utf-8"></script>
+<script src="d3tip.js" charset="utf-8"></script>
+<script src="config.js" charset="utf-8"></script>
+
+<div>
+<button id="t15">15 min.</button>
+<button id="t5">5 min.</button>
+<button id="t1">1 min.</button>
+Status: <span id="status">Connecting</span>
+</div>
+<svg class="chart"></svg>
+<table id="processlist" class="fixed">
+  <colgroup>
+    <col style="width:5em">
+    <col style="width:4em">
+    <col style="width:11em">
+    <col style="width:7em">
+    <col style="width:7em">
+    <col style="width:7em">
+    <col style="width:7em">
+  </colgroup>
+  <tr>
+    <th>tid
+    <th>prio
+    <th>user
+    <th>read KB/s
+    <th>write KB/s
+    <th>swapin %
+    <th>io %
+    <th>command
+  </tr>
+</table>
+
+<script language="javascript" type="text/javascript">
+
+var server_time = 0;
+var client_time = 0;
+var time_series = [];
+
+function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.appendChild(document.createTextNode(str));
+    return div.innerHTML;
+};
+
+function Graph(sel) {
+  var width = 980, height = 380;
+
+  var x = d3.time.scale()
+    .range([0, width - 80]);
+
+  var y = d3.scale.linear()
+    .range([height, 80]);
+
+  var xAxis = d3.svg.axis().scale(x);
+  var yAxis = d3.svg.axis().scale(y).orient("right").tickFormat(function(d) { return Math.abs(d) });
+
+  var read_tip = d3.tip()
+    .attr('class', 'd3-tip')
+    .offset([-10, 0])
+    .html(function(d) {
+      return "<strong>Task:</strong> <span style='color:red'>" + escapeHtml(d.command) + "</span><br>" +
+        "<strong>User:</strong> <span style='color:red'>" + escapeHtml(d.user) + "</span><br>" +
+        "<strong>Read KB/s:</strong> <span style='color:red'>" + escapeHtml(d.disk_read_kb) + " (" + escapeHtml(d.io_percent) + "%)</span>";
+    });
+
+  var write_tip = d3.tip()
+    .attr('class', 'd3-tip')
+    .offset([-10, 0])
+    .html(function(d) {
+      return "<strong>Task:</strong> <span style='color:red'>" + escapeHtml(d.command) + "</span><br>" +
+        "<strong>User:</strong> <span style='color:red'>" + escapeHtml(d.user) + "</span><br>" +
+        "<strong>Write KB/s:</strong> <span style='color:red'>" + escapeHtml(d.disk_write_kb) + " (" + escapeHtml(d.io_percent) + "%)</span>";
+    });
+
+  var chart = d3.select(sel)
+    .attr("width", width)
+    .attr("height", height);
+
+  var zoom = d3.behavior.zoom()
+    .on("zoom", (function(o) { return function() { o.update() } })(this));
+
+  var now = Date.now();
+
+  var cur_server_time = server_time - client_time / 1000 + now / 1000;
+  x.domain([1000 * (cur_server_time - 300), 1000 * cur_server_time]);
+  zoom.x(x);
+
+  y.domain([-100,100]);
+
+  chart.append("rect")
+    .attr("class", "pane")
+    .attr("width", width)
+    .attr("height", height)
+    .call(zoom);
+
+  chart.append("g").attr("class", "data");
+
+  chart.append("g")
+    .attr("class", "x axis")
+    .attr("transform", "translate(0," + y(0) + ")")
+    .call(xAxis);
+
+  chart.append("g")
+    .attr("class", "y axis")
+    .attr("transform", "translate(" + (width-80) + ",0)")
+    .call(yAxis);
+
+  this.setRange = function(s) {
+    var cur_server_time = server_time - client_time / 1000 + now / 1000;
+    x.domain([1000 * (cur_server_time - s), 1000 * cur_server_time]);
+    zoom.x(x);
+    this.update();
+  }
+
+  this.update = function() {
+    var new_now = Date.now();
+    var delta_time = new_now - now;
+    now = new_now;
+    var xd = x.domain();
+    var t_from = xd[0].getTime() + delta_time;
+    var t_to = xd[1].getTime() + delta_time;
+    x.domain([t_from, t_to]);
+
+    var plot_data = [];
+    var keys = Object.keys(time_series);
+    for(var i in keys) {
+      var k = keys[i];
+      var t_k = k * 1000;
+      if (t_k >= t_from && t_k <= t_to) plot_data.push(time_series[k])
+    }
+
+    var scale_y = d3.max(plot_data, function(d) { 
+      return Math.max(d.total_read, d.total_write);
+    });
+    y.domain([-scale_y, scale_y]);
+
+    var barWidth = x(1000) - x(0);
+
+    var bar = chart.select(".data").selectAll(".bar")
+      .data(plot_data, function(d) { return 't'+d[0].time; });
+
+    bar.enter().append('g').attr('class', 'bar');
+    bar.exit().remove();
+
+    var read = bar.selectAll(".read").data(function(d) { return d }, function(d) { return 'r'+d.seq });
+
+    read.enter().append('g').attr('class', 'read').append('rect').attr('class', 'sub-bar');
+    read.exit().remove();
+    read.selectAll('.sub-bar')
+      .attr('x', function(d) { return x(1000 * d.time) })
+      .attr("y", function(d) { return y(d.read_stack) + 1 })
+      .attr("width", barWidth)
+      .attr("height", function(d) { var h = y(d.read_stack - d.disk_read_kb) - y(d.read_stack) - 1; return h > 0 ? h : 0 })
+      .call(read_tip)
+      .on('mouseover', read_tip.show)
+      .on('mouseout', read_tip.hide);
+
+    var write = bar.selectAll(".write").data(function(d) { return d }, function(d) { return 'w'+d.seq });
+    write.enter().append('g').attr('class', 'write').append('rect').attr('class', 'sub-bar');
+    write.exit().remove();
+    write.selectAll('.sub-bar')
+      .attr('x', function(d) { return x(1000 * d.time) })
+      .attr('y', function(d) { return y(-d.write_stack + d.disk_write_kb) })
+      .attr("width", barWidth)
+      .attr("height", function(d) { var h = y(-d.write_stack) - y(-d.write_stack + d.disk_write_kb) - 1; return h > 0 ? h : 0 })
+      .call(write_tip)
+      .on('mouseover', write_tip.show)
+      .on('mouseout', write_tip.hide);
+
+    chart.select(".x.axis").call(xAxis);
+    chart.select(".y.axis").call(yAxis);
+  }
+}
+
+function fill_processlist_row(r, data) {
+  var td = r.getElementsByTagName('td');
+  td[0].textContent = data.tid;
+  td[1].textContent = data.prio;
+  td[2].textContent = data.user;
+  td[3].textContent = data.disk_read_kb;
+  td[4].textContent = data.disk_write_kb;
+  td[5].textContent = data.swapin_percent;
+  td[6].textContent = data.io_percent;
+  td[7].textContent = data.command;
+}
+
+function fill_processlist(t) {
+  var data = time_series[t];
+  if (data == undefined) data = [];
+  var t = document.getElementById('processlist');
+  var c = t.getElementsByTagName('tr')[1];
+  for(var i = 0; i < data.length; i++) {
+    while(c && c.tagName != 'TR') c = c.nextSibling;
+    if (c) {
+      fill_processlist_row(c, data[i]);
+      c = c.nextSibling;
+    } else {
+      var r = document.createElement('tr');
+      for(var j = 0; j < 8; j++) r.appendChild(document.createElement('td'));
+      fill_processlist_row(r, data[i]);
+      t.appendChild(r);
+    }
+  }
+  while(c && c.nextSibling) t.removeChild(c.nextSibling);
+  if (c) t.removeChild(c);
+}
+
+var websocket = new WebSocket(socket_addr);
+websocket.onopen = function(evt) { document.getElementById('status').textContent = "Connected" };
+
+var next_t;
+var graph_upd_int;
+var start_time;
+
+websocket.onmessage = function(evt) {
+  var data = JSON.parse(evt.data);
+  if (data.server_time) {
+    start_time = server_time = data.server_time;
+    client_time = Date.now();
+    return;
+  }
+  if (time_series[data.time] == undefined) {
+    data.read_stack = data.disk_read_kb;
+    data.write_stack = data.disk_write_kb;
+    var a = [data];
+    a.total_read = data.disk_read_kb;
+    a.total_write = data.disk_write_kb;
+    time_series[data.time] = a;
+  } else {
+    var a = time_series[data.time];
+    data.read_stack = data.disk_read_kb + a[a.length - 1].read_stack;
+    data.write_stack = data.disk_write_kb + a[a.length - 1].write_stack;
+    a.total_read += data.disk_read_kb;
+    a.total_write += data.disk_write_kb;
+    a.push(data);
+  }
+  if (!graph_upd_int) {
+    var graph = new Graph('.chart');
+    document.getElementById('t15').onclick = function() { graph.setRange(900) };
+    document.getElementById('t5').onclick = function() { graph.setRange(300) };
+    document.getElementById('t1').onclick = function() { graph.setRange(60) };
+    graph_upd_int = setInterval(function() { graph.update() }, 1000);
+  }
+  if (data.time < start_time) start_time = data.time;
+  while(data.time - start_time > 900) {
+    delete time_series[start_time];
+    start_time++;
+  }
+  if (data.time > server_time && Date.now() - client_time >= 500) {
+    server_time = data.time;
+    client_time = Date.now();
+    window.setTimeout((function(t) { return function() {
+      fill_processlist(t);
+    }})(server_time), 500);
+    if (next_t) window.clearTimeout(next_t);
+    next_t = window.setTimeout((function(t) { return function() {
+      fill_processlist(t);
+    }})(server_time+1), 1500);
+  }
+};
+websocket.onerror = function(evt) { document.getElementById('status').textContent = "Error" };
+</script>
